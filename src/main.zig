@@ -51,11 +51,22 @@ pub fn main() !void {
     defer std.posix.close(inotify_fd);
 
     // Map watch descriptors to directory paths
-    var watch_map = std.AutoHashMap(i32, []const u8).init(allocator);
+    var watch_map = std.AutoHashMap(i32, []u8).init(allocator);
     defer watch_map.deinit();
 
+    // Map directories to .gitignore patterns
+    var ignore_map = std.StringHashMap(bb.IgnorePatterns).init(allocator);
+    defer {
+        var it = ignore_map.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.*.deinit();
+            allocator.free(entry.key_ptr.*);
+        }
+        ignore_map.deinit();
+    }
+
     // Recursively add watches for the directory and its subdirectories
-    try bb.addRecursiveWatches(allocator, inotify_fd, path, &watch_map, os.linux.IN.CLOSE_WRITE | os.linux.IN.CREATE | os.linux.IN.MOVED_TO | os.linux.IN.DELETE);
+    try bb.addRecursiveWatches(allocator, inotify_fd, path, &watch_map, &ignore_map, os.linux.IN.CLOSE_WRITE | os.linux.IN.CREATE | os.linux.IN.MOVED_TO | os.linux.IN.DELETE);
 
     // Define inotify event structure (fixed part)
     const std_inotify_event_fixed = extern struct {
@@ -98,7 +109,7 @@ pub fn main() !void {
             if (fixed_event.mask & os.linux.IN.CREATE != 0 and fixed_event.mask & os.linux.IN.ISDIR != 0) {
                 const new_dir_path = try std.fs.path.join(allocator, &[_][]const u8{ dir_path, file_name });
                 std.log.info("New directory detected: {s}, adding watch", .{new_dir_path});
-                try bb.addRecursiveWatches(allocator, inotify_fd, new_dir_path, &watch_map, os.linux.IN.CLOSE_WRITE | os.linux.IN.CREATE | os.linux.IN.MOVED_TO | os.linux.IN.DELETE);
+                try bb.addRecursiveWatches(allocator, inotify_fd, new_dir_path, &watch_map, &ignore_map, os.linux.IN.CLOSE_WRITE | os.linux.IN.CREATE | os.linux.IN.MOVED_TO | os.linux.IN.DELETE);
             }
             // Handle directory deletion
             else if (fixed_event.mask & os.linux.IN.DELETE != 0 and fixed_event.mask & os.linux.IN.ISDIR != 0) {
@@ -107,7 +118,7 @@ pub fn main() !void {
                 _ = watch_map.remove(fixed_event.wd);
             }
             // Handle file events
-            else if (fixed_event.mask & (os.linux.IN.CLOSE_WRITE | os.linux.IN.CREATE | os.linux.IN.MOVED_TO) != 0 and bb.match(pattern, file_name)) {
+            else if (fixed_event.mask & (os.linux.IN.CLOSE_WRITE | os.linux.IN.CREATE | os.linux.IN.MOVED_TO) != 0 and bb.match(pattern, file_name, false)) {
                 std.log.info("File {s} matches pattern in {s}, running command: {s}", .{ file_name, dir_path, try std.mem.join(allocator, " ", command_args) });
                 var child = std.process.Child.init(command_args, allocator);
                 child.cwd = dir_path; // Run command in the directory of the event
